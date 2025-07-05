@@ -13,6 +13,7 @@ import uuid
 from typing import List, Dict, Optional, Any
 
 BASE_URL = f"http://192.168.201.200:8080"
+FLOW_PUSHER_URL = f"{BASE_URL}/wm/staticflowpusher/json"
 
 # === CONFIGURACIONES ===
 
@@ -35,7 +36,7 @@ MYDB_CONFIG = {
 
 SERVICIOS_POR_ROL = {
     "soporte": ["http", "dns", "ssh"],
-    "administrativo": ["http", "dns", "ssh", "mysql"]
+    "administracion": ["http", "dns", "ssh", "mysql"]
 }
 
 PUERTOS_POR_SERVICIO = {
@@ -132,10 +133,10 @@ def obtener_servicios_por_usuario(codigo_usuario):
 
 def menu_conexiones():
     while True:
-        print("\n--- MENÚ CONEXIONES ---")
-        print("1) Crear conexión")
-        print("2) Listar conexiones")
-        print("3) Eliminar conexión")
+        print("\n--- BIENVENIDO A LA RED PUCP ---")
+        print("1) Iniciar conexion")
+        print("2) Lista de servicios disponibles")
+        print("3) Eliminar conexión de servicios")
         print("0) Finalizar")
         opcion = input("Seleccione una opción: ").strip()
 
@@ -143,7 +144,8 @@ def menu_conexiones():
             # Autenticación
             print("🔐 Inicie sesión para crear una conexión:")
             usuario = input("👤 Usuario: ").strip()
-            clave = input("🔒 Contraseña: ").strip()
+            clave = getpass.getpass("🔒 Contraseña: ").strip()
+
 
             # Autenticar con FreeRADIUS y obtener rol
             autenticado, rol = autenticar_usuario(usuario, clave)
@@ -169,70 +171,73 @@ def menu_conexiones():
                 continue
 
             # Punto de red del cliente (dinámico)
-            dpid_cliente, port_cliente = get_attachment_point_by_ip(ip_alumno)
+            dpid_cliente, port_cliente = get_attachment_point(mac_alumno)
+            ip_servidor = "10.0.0.3"
+            mac_servidor = "fa:16:3e:04:3f:65" 
+            dpid_servidor, port_servidor = get_attachment_point(mac_servidor)
+
+            if None in (dpid_cliente, port_cliente, dpid_servidor, port_servidor):
+                print("❌ No se pudo obtener la ubicación de uno o ambos hosts.")
+                continue
+
+            ruta = get_route(dpid_cliente, port_cliente, dpid_servidor, port_servidor)
+            if not ruta:
+                print("❌ No se encontró una ruta entre los hosts.")
+                exit()
+
+            print(f"\n📍 Ruta detectada entre {mac_alumno} y {mac_servidor}:")
+            for sw, port in ruta:
+                print(f"  Switch: {sw}, Puerto: {port}")
+
 
             for servicio in servicios_autorizados:
                 handler = str(uuid.uuid4())[:8]
                 conexiones.append({'handler': handler, 'servicio': servicio})
                 print(f"📶 Conexión creada. Handler: {handler} para {servicio}")
 
-                ip_servidor = "10.0.0.3"
-                mac_servidor = "fa:16:3e:04:3f:65"  # debes asegurarte de que sea la correcta
                 puerto_servicio = PUERTOS_POR_SERVICIO.get(servicio)
-
                 if not puerto_servicio:
                     print(f"❌ Puerto no definido para el servicio: {servicio}")
-                    continue
+                    continue                
 
-                dpid_servidor, port_servidor = get_attachment_point_by_ip(ip_servidor)
-                if not dpid_servidor or not port_servidor:
-                    print("❌ No se pudo obtener el DPID o puerto del servidor.")
-                    continue
+                # Flujos TCP
+                flows_ida = generar_flows(ruta, ip_alumno, ip_servidor, puerto_servicio, mac_alumno, mac_servidor, handler, direccion="ida")
+                flows_vuelta = generar_flows(ruta, ip_alumno, ip_servidor, puerto_servicio, mac_alumno, mac_servidor, handler, direccion="vuelta")
 
-                # ➤ FLOW FW: Cliente → Servidor
-                flow_fw = build_flow(handler, dpid_cliente, mac_alumno, ip_alumno, mac_servidor, ip_servidor, puerto_servicio, port_cliente, sentido="fw")
-                push_flow(flow_fw)
-                print(f"✅ Flow Forward: {flow_fw['name']}")
+                # Flujos ARP
+                flow_arp_fw = build_arp_flow(handler, dpid_cliente, ip_alumno, ip_servidor, port_cliente, "arp_fw")
+                flow_arp_bw = build_arp_flow(handler, dpid_servidor, ip_servidor, ip_alumno, port_servidor, "arp_bw")
 
-                # ➤ FLOW BW: Servidor → Cliente
-                flow_bw = build_flow(handler, dpid_servidor, mac_servidor, ip_servidor, mac_alumno, ip_alumno, puerto_servicio, port_servidor, sentido="bw")
-                push_flow(flow_bw)
-                print(f"✅ Flow Reverse: {flow_bw['name']}")
-
-                # ➤ ARP FW
-                flow_arp_fw = build_arp_flow(handler, dpid_cliente, ip_alumno, ip_servidor, port_cliente, sentido="arp_fw")
-                push_flow(flow_arp_fw)
-                print(f"✅ Flow ARP FW: {flow_arp_fw['name']}")
-
-                # ➤ ARP BW
-                flow_arp_bw = build_arp_flow(handler, dpid_servidor, ip_servidor, ip_alumno, port_servidor, sentido="arp_bw")
-                push_flow(flow_arp_bw)
-                print(f"✅ Flow ARP BW: {flow_arp_bw['name']}")
+                # Enviar todo
+                enviar_flows(flows_ida + flows_vuelta + [flow_arp_fw, flow_arp_bw])
 
 
         elif opcion == '2':
             if not conexiones:
-                print("No hay conexiones creadas.")
+                print("No hay conexiones de servicios disponibles.")
             else:
                 for c in conexiones:
                     print(f"Handler: {c['handler']}, Servicio: {c['servicio']}")
 
         elif opcion == '3':
-            handler = input("Handler de la conexión a eliminar: ")
+            handler = input("Ingrese el handler de la conexión que desea eliminar: ")
+            encontrado = False
             for i, c in enumerate(conexiones):
                 if c['handler'] == handler:
                     # Eliminar los flows correspondientes en Floodlight
-                    delete_flow(f"{handler}_fw")
-                    delete_flow(f"{handler}_bw")
+                    for j in range(len(ruta) - 1):
+                        delete_flow(f"{handler}_ida_{j}")
+                        delete_flow(f"{handler}_vuelta_{j}")
                     delete_flow(f"{handler}_arp_fw")
                     delete_flow(f"{handler}_arp_bw")
 
-                    # Eliminar la conexión de la lista
                     conexiones.pop(i)
-                    print(" Conexión eliminada y flows removidos.")
-                    break
-            else:
-                print(" No se encontró el handler.")
+                    print("✅ Conexión eliminada y flows removidos.")
+                    encontrado = True
+                    break  # salimos del bucle
+            if not encontrado:
+                print("❌ No se encontró el handler.")
+
 
         elif opcion == '0':
             print("👋 Saliendo del sistema.")
@@ -240,19 +245,57 @@ def menu_conexiones():
         else:
             print("⚠️ Opción no válida.")
 
-def get_attachment_point_by_ip(ip):
+#obtenemos el dpid del switch asi como el puerto
+def get_attachment_point(mac):
     url = f"{BASE_URL}/wm/device/"
-    try:
-        r = requests.get(url)
-        if r.status_code == 200:
-            for dev in r.json():
-                if ip in dev.get("ipv4", []):
-                    ap = dev.get("attachmentPoint", [])
-                    if ap:
-                        return ap[0].get("switchDPID"), ap[0].get("port")
-    except Exception as e:
-        print(f"Error al consultar Floodlight: {e}")
+    r = requests.get(url)
+    if r.status_code == 200:
+        for dev in r.json():
+            if mac.lower() in [m.lower() for m in dev.get("mac", [])]:
+                point = dev.get("attachmentPoint", [{}])[0]
+                return point.get("spwitchDPID"), point.get("port")
     return None, None
+
+#obtenemos la ruta de switches para ir del cliente al servidor
+def get_route(src_dpid, src_port, dst_dpid, dst_port):
+    url = f"{BASE_URL}/wm/topology/route/{src_dpid}/{src_port}/{dst_dpid}/{dst_port}/json"
+    r = requests.get(url)
+    if r.status_code == 200:
+        return [(step["switch"], step["port"]) for step in r.json()]
+    return []
+
+def generar_flows(ruta, ip_src, ip_dst, tcp_port, mac_src, mac_dst, handler, direccion="ida"):
+    flows = []
+    for i in range(len(ruta) - 1):
+        sw_actual, in_port_obj = ruta[i]
+        in_port = in_port_obj["portNumber"] if isinstance(in_port_obj, dict) else in_port_obj
+
+        _, out_port_obj = ruta[i + 1]
+        out_port = out_port_obj["portNumber"] if isinstance(out_port_obj, dict) else out_port_obj
+
+
+        flow = {
+            "switch": sw_actual,
+            "name": f"{handler}_{direccion}_{i}",
+            "priority": "32768",
+            "eth_type": "0x0800",
+            "eth_src": mac_src,
+            "eth_dst": mac_dst,
+            "ipv4_src": ip_src if direccion == "ida" else ip_dst,
+            "ipv4_dst": ip_dst if direccion == "ida" else ip_src,
+            "ip_proto": "0x06",
+            "tcp_dst": str(tcp_port) if direccion == "ida" else None,
+            "tcp_src": str(tcp_port) if direccion == "vuelta" else None,
+            "in_port": str(in_port),
+            "active": "true",
+            "actions": f"output={out_port}"
+        }
+
+        # Eliminar campos None
+        flows.append({k: v for k, v in flow.items() if v is not None})
+    return flows
+
+
 
 def build_flow(handler, dpid, mac_src, ip_src, mac_dst, ip_dst, tcp_port, out_port, sentido="fw"):
     """
@@ -292,17 +335,15 @@ def build_arp_flow(handler, dpid, ip_src, ip_dst, out_port, sentido="arp"):
     return flow
 
 # ===== insertar y eliminar flows =====
-def push_flow(flow):
-    url = f"{BASE_URL}/wm/staticflowpusher/json"
-    headers = {"Content-Type": "application/json"}
-    try:
-        response = requests.post(url, json=flow, headers=headers)
+def enviar_flows(flows):
+    for flow in flows:
+        print(f"\n📤 Enviando flow: {flow['name']}")
+        print(json.dumps(flow, indent=2))
+        response = requests.post(FLOW_PUSHER_URL, json=flow)
         if response.status_code == 200:
-            print(" Flow instalado en Floodlight.")
+            print(f"✅ Flow '{flow['name']}' instalado.")
         else:
-            print(f" Error al instalar flow: {response.text}")
-    except Exception as e:
-        print(f" No se pudo conectar a Floodlight: {e}")
+            print(f"❌ Error al instalar '{flow['name']}': {response.status_code} - {response.text}")
 
 
 def delete_flow(flow_name):
